@@ -1,0 +1,131 @@
+name: Build WSL2 ARM64 kernel for Waydroid
+
+# Builds microsoft/WSL2-Linux-Kernel for ARM64 with the Android binder driver
+# enabled (needed by Waydroid) and produces:
+#   Image          -> the kernel   (.wslconfig: kernel=)
+#   modules.vhdx   -> the modules  (.wslconfig: kernelModules=)
+#   .config        -> the final kernel config used
+#
+# Put this file in your fork at .github/workflows/ on the default branch,
+# then run it from the Actions tab ("Run workflow").
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or branch of this fork to build"
+        default: "linux-msft-wsl-6.18.58.1"
+        required: true
+        type: string
+      lean:
+        description: "Drop debug info / BTF (much smaller build, fits the free runner disk)"
+        default: true
+        type: boolean
+      release:
+        description: "Also publish the files as a GitHub Release"
+        default: true
+        type: boolean
+
+permissions:
+  contents: write # only used to create the release
+
+jobs:
+  build:
+    # Native ARM64 runner: free for public repos (forks of public repos are public).
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex dwarves libssl-dev libelf-dev \
+            cpio rsync e2fsprogs qemu-utils python3
+
+      - name: Configure (stock WSL ARM64 config + binder)
+        env:
+          LEAN: ${{ inputs.lean }}
+        run: |
+          cp Microsoft/config-wsl-arm64 .config
+
+          # Android binder, required by Waydroid
+          scripts/config --enable ANDROID_BINDER_IPC
+          scripts/config --enable ANDROID_BINDERFS
+          scripts/config --set-str ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder"
+
+          if [ "$LEAN" = "true" ]; then
+            scripts/config --disable DEBUG_INFO_BTF
+            scripts/config --disable DEBUG_INFO_BTF_MODULES
+            scripts/config --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+            scripts/config --enable DEBUG_INFO_NONE
+          fi
+
+          make olddefconfig
+
+          # Fail early if binder did not survive olddefconfig
+          grep -q '^CONFIG_ANDROID_BINDER_IPC=y' .config
+          grep -q '^CONFIG_ANDROID_BINDERFS=y' .config
+          grep -q '^CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"' .config
+          make -s kernelrelease
+
+      - name: Build kernel and modules
+        run: make -j"$(nproc)" Image modules
+
+      - name: Install modules, headers and package artifacts
+        run: |
+          KREL="$(make -s kernelrelease)"
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+
+          mkdir -p out modules headers perf
+          make modules_install INSTALL_MOD_PATH="$PWD/modules" INSTALL_MOD_STRIP=1
+          make headers_install INSTALL_HDR_PATH="$PWD/headers"
+
+          # perf is optional and is left empty to keep the build short
+          Microsoft/scripts/gen_artifacts_vhdx.sh modules headers perf "$KREL" out/modules.vhdx
+
+          cp arch/arm64/boot/Image out/Image
+          cp .config out/config-wsl-arm64-waydroid
+          ls -lh out
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl2-arm64-waydroid-kernel-${{ env.KREL }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: waydroid-${{ inputs.ref }}
+        run: |
+          cat > notes.md <<EOF
+          WSL2 ARM64 kernel \`$KREL\` with Android binder enabled (for Waydroid).
+          Built from \`${{ inputs.ref }}\`.
+
+          Copy \`Image\` and \`modules.vhdx\` somewhere on Windows, then in \`%UserProfile%\\.wslconfig\`:
+
+          \`\`\`ini
+          [wsl2]
+          kernel=C:\\\\wslkernel\\\\Image
+          kernelModules=C:\\\\wslkernel\\\\modules.vhdx
+          \`\`\`
+
+          Run \`wsl.exe --shutdown\`, reopen WSL and check \`uname -r\`.
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/Image out/modules.vhdx out/config-wsl-arm64-waydroid --clobber
+          else
+            gh release create "$TAG" out/Image out/modules.vhdx out/config-wsl-arm64-waydroid \
+              --target "$GITHUB_SHA" --title "WSL2 ARM64 + binder ($KREL)" --notes-file notes.md
+          fi
