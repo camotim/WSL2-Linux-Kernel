@@ -114,6 +114,10 @@ jobs:
 
           cp arch/arm64/boot/Image out/Image
           cp .config out/config-wsl-arm64-waydroid
+
+          # Plain modules tarball (lib/modules/<krel>) for building bootable rootfs images
+          tar -C modules --exclude="lib/modules/*/build" --exclude="lib/modules/*/source" \
+              -cJf "out/modules-$KREL.tar.xz" lib
           ls -lh out
 
       - name: Upload artifacts
@@ -146,8 +150,8 @@ jobs:
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" out/Image out/modules.vhdx out/config-wsl-arm64-waydroid --clobber
+            gh release upload "$TAG" out/Image out/modules.vhdx out/modules-*.tar.xz out/config-wsl-arm64-waydroid --clobber
           else
-            gh release create "$TAG" out/Image out/modules.vhdx out/config-wsl-arm64-waydroid \
+            gh release create "$TAG" out/Image out/modules.vhdx out/modules-*.tar.xz out/config-wsl-arm64-waydroid \
               --target "$GITHUB_SHA" --title "WSL2 ARM64 + binder ($KREL)" --notes-file notes.md
           fi
