@@ -17,6 +17,10 @@ on:
         default: "linux-msft-wsl-6.18.58.1"
         required: true
         type: string
+      desktop:
+        description: "Add desktop options (DRM_HYPERV module, evdev, virtio-input/gpu, balloon, vsock)"
+        default: true
+        type: boolean
       lean:
         description: "Drop debug info / BTF (much smaller build, fits the free runner disk)"
         default: true
@@ -52,6 +56,7 @@ jobs:
       - name: Configure (stock WSL ARM64 config + binder)
         env:
           LEAN: ${{ inputs.lean }}
+          DESKTOP: ${{ inputs.desktop }}
         run: |
           cp Microsoft/config-wsl-arm64 .config
 
@@ -59,6 +64,23 @@ jobs:
           scripts/config --enable ANDROID_BINDER_IPC
           scripts/config --enable ANDROID_BINDERFS
           scripts/config --set-str ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder"
+
+          if [ "$DESKTOP" = "true" ]; then
+            # Display: FB_HYPERV stays as in stock (proven on Snapdragon X);
+            # DRM_HYPERV is added as a module, plus UEFI fb fallback and virtio-gpu
+            scripts/config --module DRM_HYPERV \
+                           --enable SYSFB_SIMPLEFB --enable DRM_SIMPLEDRM \
+                           --module DRM_VIRTIO_GPU --enable DRM_FBDEV_EMULATION
+            # Input: evdev is off in the stock WSL config but Wayland/X11 need it
+            scripts/config --enable INPUT_EVDEV --enable HYPERV_KEYBOARD \
+                           --module HID_HYPERV_MOUSE --enable VIRTIO_INPUT \
+                           --module HID_GENERIC --module USB_HID
+            # Memory / host integration
+            scripts/config --enable VIRTIO_BALLOON --enable PAGE_REPORTING \
+                           --enable VIRTIO_VSOCKETS --enable ZRAM
+            # Audio (virtio-snd only)
+            scripts/config --enable SOUND --enable SND --module SND_VIRTIO
+          fi
 
           if [ "$LEAN" = "true" ]; then
             scripts/config --disable DEBUG_INFO_BTF
