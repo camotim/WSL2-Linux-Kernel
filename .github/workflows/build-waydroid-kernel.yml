@@ -29,6 +29,11 @@ on:
         description: "Also publish the files as a GitHub Release"
         default: true
         type: boolean
+      release_tag:
+        description: "Release tag to publish to (empty = waydroid-<ref>, plus -desktop when desktop is on)"
+        default: ""
+        required: false
+        type: string
 
 permissions:
   contents: write # only used to create the release
@@ -132,7 +137,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: waydroid-${{ inputs.ref }}
+          TAG: ${{ inputs.release_tag || format('waydroid-{0}{1}', inputs.ref, inputs.desktop && '-desktop' || '') }}
         run: |
           cat > notes.md <<EOF
           WSL2 ARM64 kernel \`$KREL\` with Android binder enabled (for Waydroid).
@@ -149,9 +154,21 @@ jobs:
           Run \`wsl.exe --shutdown\`, reopen WSL and check \`uname -r\`.
           EOF
 
+          NEW_FILES=(out/Image out/modules.vhdx out/modules-*.tar.xz out/config-wsl-arm64-waydroid)
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" out/Image out/modules.vhdx out/modules-*.tar.xz out/config-wsl-arm64-waydroid --clobber
+            # Same tag built again: remove the previous build's assets first, so a
+            # changed kernel release string cannot leave a stale modules-*.tar.xz
+            # (or any other old file) next to the new Image.
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r name; do
+              case "$name" in
+                Image|modules.vhdx|modules-*.tar.xz|config-wsl-arm64-waydroid)
+                  gh release delete-asset "$TAG" "$name" --yes ;;
+              esac
+            done
+            gh release upload "$TAG" "${NEW_FILES[@]}"
+            gh release edit "$TAG" --title "WSL2 ARM64 + binder ($KREL)" --notes-file notes.md
           else
-            gh release create "$TAG" out/Image out/modules.vhdx out/modules-*.tar.xz out/config-wsl-arm64-waydroid \
+            gh release create "$TAG" "${NEW_FILES[@]}" \
               --target "$GITHUB_SHA" --title "WSL2 ARM64 + binder ($KREL)" --notes-file notes.md
           fi
