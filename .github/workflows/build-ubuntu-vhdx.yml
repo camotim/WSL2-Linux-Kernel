@@ -14,7 +14,7 @@ on:
     inputs:
       kernel_tag:
         description: "Release tag that holds Image and modules-*.tar.xz"
-        default: "waydroid-linux-msft-wsl-6.18.58.1"
+        default: "waydroid-linux-msft-wsl-6.18.58.1-desktop"
         required: true
         type: string
       kernel_repo:
@@ -93,7 +93,15 @@ jobs:
             --pattern 'Image' --pattern 'modules-*.tar.xz' --dir kernel
           ls -lh kernel
           test -s kernel/Image
-          ls kernel/modules-*.tar.xz
+
+          # Exactly one modules tarball must belong to this Image; several means a
+          # release that mixes builds, which would boot with mismatched modules.
+          shopt -s nullglob
+          MODS=(kernel/modules-*.tar.xz)
+          if [ "${#MODS[@]}" -ne 1 ]; then
+            echo "::error::Release $KERNEL_TAG has ${#MODS[@]} modules-*.tar.xz assets (need exactly 1): ${MODS[*]:-none}. Re-run the kernel workflow for this tag, or use a different kernel_tag."
+            exit 1
+          fi
 
       - name: Install build tools
         run: |
@@ -353,7 +361,15 @@ jobs:
 
           FILES=(out/*)
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${FILES[@]}" --clobber
+            # Same release tag built again: drop earlier images so only this build remains.
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r name; do
+              case "$name" in
+                ubuntu-*.vhdx.zip|ubuntu-*.vhdx.zip.sha256)
+                  gh release delete-asset "$TAG" "$name" --yes ;;
+              esac
+            done
+            gh release upload "$TAG" "${FILES[@]}"
+            gh release edit "$TAG" --title "Ubuntu $SUITE ARM64 VHDX ($KREL)" --notes-file notes.md
           else
             gh release create "$TAG" "${FILES[@]}" --target "$GITHUB_SHA" \
               --title "Ubuntu $SUITE ARM64 VHDX ($KREL)" --notes-file notes.md
