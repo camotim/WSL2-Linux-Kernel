@@ -1,0 +1,360 @@
+name: Build bootable Ubuntu VHDX (WSL2 kernel, Hyper-V Gen 2 ARM64)
+
+# Takes the kernel published by "Build WSL2 ARM64 kernel for Waydroid"
+# (Image + modules-<krel>.tar.xz from a GitHub Release), builds an Ubuntu ARM64
+# root filesystem with debootstrap, generates an initramfs for that kernel,
+# lays it all out on a GPT disk (EFI system partition + ext4 root, GRUB as the
+# UEFI boot loader) and publishes ONE bootable .vhdx as a GitHub Release asset.
+#
+# Run it from the Actions tab of your fork, after the kernel workflow has
+# produced a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: "Release tag that holds Image and modules-*.tar.xz"
+        default: "waydroid-linux-msft-wsl-6.18.58.1"
+        required: true
+        type: string
+      kernel_repo:
+        description: "owner/repo holding that release (empty = this repository)"
+        default: ""
+        required: false
+        type: string
+      suite:
+        description: "Ubuntu release codename (noble or newer: needs the separate systemd-resolved package)"
+        default: "noble"
+        type: string
+      desktop:
+        description: "Desktop to preinstall (xfce adds ~1.5 GB, installs xubuntu-core)"
+        default: "none"
+        type: choice
+        options: [none, xfce]
+      disk_gb:
+        description: "Virtual disk size in GB (root partition fills it; the VHDX file stays small)"
+        default: "12"
+        type: string
+      username:
+        description: "Login user (password is the same as the user name)"
+        default: "ubuntu"
+        type: string
+      hostname:
+        description: "Hostname"
+        default: "ubuntu-wslk"
+        type: string
+      video:
+        description: "hyperv_fb resolution (WIDTHxHEIGHT)"
+        default: "1024x768"
+        type: string
+      expire_password:
+        description: "Force a password change at first login"
+        default: true
+        type: boolean
+      release:
+        description: "Publish the image as a GitHub Release (otherwise it is kept as a workflow artifact)"
+        default: true
+        type: boolean
+
+permissions:
+  contents: write # only used to create the release
+
+jobs:
+  image:
+    # Native ARM64 runner: debootstrap and update-initramfs run without emulation.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    env:
+      KERNEL_TAG: ${{ inputs.kernel_tag }}
+      KERNEL_REPO: ${{ inputs.kernel_repo || github.repository }}
+      SUITE: ${{ inputs.suite }}
+      DESKTOP: ${{ inputs.desktop }}
+      DISK_GB: ${{ inputs.disk_gb }}
+      USERNAME: ${{ inputs.username }}
+      HOSTNAME_: ${{ inputs.hostname }}
+      VIDEO: ${{ inputs.video }}
+      EXPIRE: ${{ inputs.expire_password }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$SUITE" =~ ^[a-z]+$ ]] || { echo "invalid suite"; exit 1; }
+          [[ "$DISK_GB" =~ ^[0-9]+$ ]] && [ "$DISK_GB" -ge 4 ] || { echo "disk_gb must be a number >= 4"; exit 1; }
+          [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || { echo "invalid username"; exit 1; }
+          [[ "$HOSTNAME_" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "invalid hostname"; exit 1; }
+          [[ "$VIDEO" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] || { echo "video must look like 1024x768"; exit 1; }
+
+      - name: Download kernel from the release
+        run: |
+          mkdir -p kernel
+          gh release download "$KERNEL_TAG" --repo "$KERNEL_REPO" \
+            --pattern 'Image' --pattern 'modules-*.tar.xz' --dir kernel
+          ls -lh kernel
+          test -s kernel/Image
+          ls kernel/modules-*.tar.xz
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap ubuntu-keyring gdisk dosfstools e2fsprogs qemu-utils \
+            grub-common grub-efi-arm64-bin uuid-runtime util-linux zip xz-utils
+
+      - name: Build the disk image
+        run: |
+          set -euxo pipefail
+          WORK="$PWD/build"
+          mkdir -p "$WORK/mnt"
+          cd "$WORK"
+
+          cleanup() {
+            set +e
+            sudo umount -R "$WORK/mnt" 2>/dev/null
+            [ -n "${LOOP:-}" ] && sudo losetup -d "$LOOP" 2>/dev/null
+          }
+          trap cleanup EXIT
+
+          # ---- kernel release string, from the modules tarball ----
+          MODTAR="$(ls "$PWD"/../kernel/modules-*.tar.xz | head -n1)"
+          KREL="$(tar -tJf "$MODTAR" | awk -F/ 'NF>=3 && $1=="lib" && $2=="modules" {print $3; exit}')"
+          [ -n "$KREL" ] || { echo "could not find lib/modules/<krel> in $MODTAR"; exit 1; }
+          echo "Kernel release: $KREL"
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+
+          # ---- partition: 256 MiB ESP + ext4 root, GPT ----
+          truncate -s "${DISK_GB}G" disk.raw
+          sgdisk --zap-all disk.raw >/dev/null
+          sgdisk -n 1:2048:+256M -t 1:EF00 -c 1:EFI \
+                 -n 2:0:0        -t 2:8300 -c 2:rootfs disk.raw
+          LOOP="$(sudo losetup --find --show --partscan disk.raw)"
+          sudo partprobe "$LOOP" || true
+          sudo udevadm settle || true
+          ls -l "${LOOP}"p1 "${LOOP}"p2
+
+          ROOT_UUID="$(uuidgen)"
+          sudo mkfs.vfat -F32 -n EFI "${LOOP}p1"
+          sudo mkfs.ext4 -F -q -L ubuntu-root -U "$ROOT_UUID" "${LOOP}p2"
+          ESP_UUID="$(sudo blkid -s UUID -o value "${LOOP}p1")"
+
+          sudo mount "${LOOP}p2" mnt
+          sudo mkdir -p mnt/boot/efi
+          sudo mount "${LOOP}p1" mnt/boot/efi
+
+          # ---- Ubuntu root filesystem ----
+          sudo debootstrap --arch=arm64 --variant=minbase --components=main,universe \
+            --include=systemd-sysv,systemd-resolved,libpam-systemd,udev,dbus,kmod,initramfs-tools,sudo,openssh-server,iproute2,iputils-ping,ca-certificates,locales,nano,less,procps,netbase \
+            "$SUITE" mnt http://ports.ubuntu.com/ubuntu-ports
+
+          # ---- kernel + modules ----
+          sudo tar -C mnt/usr -xJf "$MODTAR"
+          test -d "mnt/usr/lib/modules/$KREL"
+          sudo install -m 0644 ../kernel/Image "mnt/boot/vmlinuz-$KREL"
+
+          # ---- static configuration ----
+          echo "$HOSTNAME_" | sudo tee mnt/etc/hostname >/dev/null
+          printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$HOSTNAME_" \
+            | sudo tee mnt/etc/hosts >/dev/null
+          printf 'UUID=%s / ext4 defaults,discard 0 1\nUUID=%s /boot/efi vfat umask=0077 0 1\n' \
+            "$ROOT_UUID" "$ESP_UUID" | sudo tee mnt/etc/fstab >/dev/null
+
+          sudo rm -f mnt/etc/apt/sources.list
+          sudo tee mnt/etc/apt/sources.list.d/ubuntu.sources >/dev/null <<EOF
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: $SUITE $SUITE-updates $SUITE-backports $SUITE-security
+          Components: main universe restricted multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
+          sudo mkdir -p mnt/etc/systemd/network
+          sudo tee mnt/etc/systemd/network/20-wired.network >/dev/null <<'EOF'
+          [Match]
+          Name=en* eth*
+
+          [Network]
+          DHCP=yes
+          EOF
+
+          # Generate SSH host keys on first boot so images never share keys
+          sudo tee mnt/etc/systemd/system/ssh-hostkeys-firstboot.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Generate SSH host keys on first boot
+          DefaultDependencies=no
+          ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+          After=local-fs.target
+          Before=sysinit.target ssh.service ssh.socket
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/ssh-keygen -A
+
+          [Install]
+          WantedBy=sysinit.target
+          EOF
+
+          # ---- configure inside the chroot ----
+          sudo tee mnt/tmp/setup.sh >/dev/null <<'EOS'
+          #!/bin/bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+
+          apt-get update
+          apt-get -y upgrade
+
+          if [ "$DESKTOP" = "xfce" ]; then
+            apt-get install -y xubuntu-core xserver-xorg-video-fbdev
+          fi
+
+          locale-gen en_US.UTF-8
+          update-locale LANG=en_US.UTF-8
+
+          useradd -m -s /bin/bash -G sudo,adm,dialout,video "$USERNAME"
+          echo "$USERNAME:$USERNAME" | chpasswd
+          if [ "$EXPIRE" = "true" ]; then passwd -e "$USERNAME"; fi
+
+          systemctl enable systemd-networkd systemd-resolved ssh ssh-hostkeys-firstboot.service
+          rm -f /etc/ssh/ssh_host_*
+
+          # The kernel only has gzip initramfs support (no zstd/xz)
+          sed -i 's/^COMPRESS=.*/COMPRESS=gzip/' /etc/initramfs-tools/initramfs.conf
+          grep -q '^COMPRESS=gzip' /etc/initramfs-tools/initramfs.conf
+          rm -f "/lib/modules/$KREL/build" "/lib/modules/$KREL/source"
+          depmod -a "$KREL"
+          update-initramfs -c -k "$KREL"
+          gzip -t "/boot/initrd.img-$KREL"
+
+          # first-boot machine-id, tidy up
+          : > /etc/machine-id
+          mkdir -p /var/lib/dbus
+          ln -sf /etc/machine-id /var/lib/dbus/machine-id
+          rm -f /etc/resolv.conf
+          ln -s ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+          rm -f /usr/sbin/policy-rc.d
+          apt-get clean
+          rm -rf /var/lib/apt/lists/* /var/tmp/*
+          EOS
+          sudo chmod +x mnt/tmp/setup.sh
+
+          sudo cp -L /etc/resolv.conf mnt/etc/resolv.conf
+          for d in dev dev/pts proc sys run; do sudo mount --bind "/$d" "mnt/$d"; done
+          sudo chroot mnt env KREL="$KREL" DESKTOP="$DESKTOP" USERNAME="$USERNAME" EXPIRE="$EXPIRE" \
+            /bin/bash /tmp/setup.sh
+          sudo rm -f mnt/tmp/setup.sh
+          for d in run sys proc dev/pts dev; do sudo umount "mnt/$d"; done
+
+          test -s "mnt/boot/initrd.img-$KREL"
+
+          # ---- GRUB (UEFI, removable path) ----
+          sudo mkdir -p mnt/boot/grub
+          sudo tee mnt/boot/grub/grub.cfg >/dev/null <<EOF
+          set timeout=3
+          set default=0
+
+          menuentry "Ubuntu $SUITE (WSL2 kernel $KREL)" {
+              search --no-floppy --fs-uuid --set=root $ROOT_UUID
+              linux /boot/vmlinuz-$KREL root=UUID=$ROOT_UUID rw rootwait console=tty0 video=hyperv_fb:$VIDEO loglevel=4
+              initrd /boot/initrd.img-$KREL
+          }
+
+          menuentry "Ubuntu $SUITE (debug: verbose kernel log)" {
+              search --no-floppy --fs-uuid --set=root $ROOT_UUID
+              linux /boot/vmlinuz-$KREL root=UUID=$ROOT_UUID rw rootwait console=tty0 video=hyperv_fb:$VIDEO ignore_loglevel debug
+              initrd /boot/initrd.img-$KREL
+          }
+          EOF
+
+          cat > embedded.cfg <<EOF
+          search --no-floppy --fs-uuid --set=root $ROOT_UUID
+          configfile /boot/grub/grub.cfg
+          EOF
+          sudo mkdir -p mnt/boot/efi/EFI/BOOT
+          sudo grub-mkstandalone -O arm64-efi \
+            -o mnt/boot/efi/EFI/BOOT/BOOTAA64.EFI \
+            --modules="part_gpt part_msdos fat ext2 normal configfile linux search search_fs_uuid echo all_video efi_gop" \
+            "boot/grub/grub.cfg=embedded.cfg"
+          test -s mnt/boot/efi/EFI/BOOT/BOOTAA64.EFI
+
+          # ---- keep the image sparse, then close everything ----
+          sudo fstrim -v mnt/boot/efi || true
+          sudo fstrim -v mnt || true
+          sudo umount -R mnt
+          sudo losetup -d "$LOOP"
+          LOOP=""
+          du -h --apparent-size disk.raw
+          du -h disk.raw
+
+      - name: Convert to VHDX and package
+        run: |
+          set -euxo pipefail
+          cd build
+          SAFE_KREL="${KREL//+/_}"
+          BASE="ubuntu-${SUITE}-arm64-wslk-${SAFE_KREL}"
+          qemu-img convert -f raw -O vhdx -o subformat=dynamic disk.raw "$BASE.vhdx"
+          rm -f disk.raw
+          ls -lh "$BASE.vhdx"
+
+          mkdir -p ../out
+          zip -6 "../out/$BASE.vhdx.zip" "$BASE.vhdx"
+          (cd ../out && sha256sum "$BASE.vhdx.zip" > "$BASE.vhdx.zip.sha256")
+          ls -lh ../out
+
+          SIZE="$(stat -c%s "../out/$BASE.vhdx.zip")"
+          if [ "$SIZE" -ge 2147483648 ]; then
+            echo "::error::The zipped image is $SIZE bytes; GitHub release assets are limited to 2 GiB. Use desktop=none or a smaller disk_gb."
+            exit 1
+          fi
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+
+      - name: Upload as workflow artifact
+        if: ${{ !inputs.release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BASE }}
+          path: out/
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish release
+        if: ${{ inputs.release }}
+        env:
+          GH_REPO: ${{ github.repository }}
+          TAG: vhdx-${{ inputs.suite }}-${{ inputs.kernel_tag }}
+        run: |
+          cat > notes.md <<'EOF'
+          Bootable Ubuntu @SUITE@ ARM64 disk (VHDX) for Hyper-V Generation 2, using the WSL2 kernel `@KREL@`
+          (from release `@KERNEL_TAG@`), with an initramfs and GRUB on a UEFI ESP.
+
+          Login: `@USERNAME@` / `@USERNAME@` (@EXPIRE_NOTE@). Desktop: @DESKTOP@.
+
+          On the Windows 11 ARM64 host (PowerShell as administrator):
+
+          ```powershell
+          Expand-Archive .\@BASE@.vhdx.zip C:\VMs\
+          New-VM -Name UbuntuWSLK -Generation 2 -MemoryStartupBytes 4GB `
+                 -VHDPath C:\VMs\@BASE@.vhdx -SwitchName "Default Switch"
+          Set-VMProcessor -VMName UbuntuWSLK -Count 4
+          Set-VMFirmware -VMName UbuntuWSLK -EnableSecureBoot Off
+          Start-VM UbuntuWSLK
+          vmconnect.exe localhost UbuntuWSLK
+          ```
+
+          Secure Boot must stay off because the kernel and GRUB are not signed.
+          SSH host keys are generated on first boot. Change the default password.
+          EOF
+          sed -i \
+            -e "s|@SUITE@|$SUITE|g" -e "s|@KREL@|$KREL|g" -e "s|@KERNEL_TAG@|$KERNEL_TAG|g" \
+            -e "s|@USERNAME@|$USERNAME|g" -e "s|@DESKTOP@|$DESKTOP|g" -e "s|@BASE@|$BASE|g" \
+            -e "s|@EXPIRE_NOTE@|$([ "$EXPIRE" = true ] && echo 'password change forced at first login' || echo 'password not expired')|" \
+            notes.md
+
+          FILES=(out/*)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" --target "$GITHUB_SHA" \
+              --title "Ubuntu $SUITE ARM64 VHDX ($KREL)" --notes-file notes.md
+          fi
