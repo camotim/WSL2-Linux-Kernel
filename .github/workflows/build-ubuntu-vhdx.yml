@@ -125,8 +125,11 @@ jobs:
           trap cleanup EXIT
 
           # ---- kernel release string, from the modules tarball ----
-          MODTAR="$(ls "$PWD"/../kernel/modules-*.tar.xz | head -n1)"
-          KREL="$(tar -tJf "$MODTAR" | awk -F/ 'NF>=3 && $1=="lib" && $2=="modules" {print $3; exit}')"
+          MODS=("$PWD"/../kernel/modules-*.tar.xz)
+          MODTAR="${MODS[0]}"
+          # Skip the bare "lib/modules/" directory entry (empty 3rd field) and read the
+          # whole listing: exiting awk early would SIGPIPE tar and fail under pipefail.
+          KREL="$(tar -tJf "$MODTAR" | awk -F/ '$1=="lib" && $2=="modules" && $3!="" && !seen {print $3; seen=1}')"
           [ -n "$KREL" ] || { echo "could not find lib/modules/<krel> in $MODTAR"; exit 1; }
           echo "Kernel release: $KREL"
           echo "KREL=$KREL" >> "$GITHUB_ENV"
